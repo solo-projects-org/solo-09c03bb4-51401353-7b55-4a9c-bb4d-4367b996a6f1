@@ -17,13 +17,15 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 
 CREATE TABLE IF NOT EXISTS holding_file (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    period      TEXT NOT NULL CHECK (period IN ('begin', 'end')),
-    as_of_date  TEXT NOT NULL,
-    filename    TEXT NOT NULL,
-    row_count   INTEGER NOT NULL,
-    is_current  INTEGER NOT NULL DEFAULT 1,
-    uploaded_at TEXT NOT NULL DEFAULT (datetime('now'))
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    period       TEXT NOT NULL CHECK (period IN ('begin', 'end')),
+    as_of_date   TEXT NOT NULL,
+    filename     TEXT NOT NULL,
+    row_count    INTEGER NOT NULL,
+    is_current   INTEGER NOT NULL DEFAULT 1,
+    source       TEXT NOT NULL DEFAULT 'upload',
+    merge_run_id INTEGER,
+    uploaded_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_holding_current ON holding_file(period, is_current);
 
@@ -54,6 +56,32 @@ CREATE TABLE IF NOT EXISTS announcement (
     ratio          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_announcement_batch ON announcement(batch_id);
+
+CREATE TABLE IF NOT EXISTS merge_run (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    report_date          TEXT NOT NULL,
+    accounts_json        TEXT NOT NULL,
+    status               TEXT NOT NULL
+                         CHECK (status IN ('awaiting_accounts', 'verified', 'retry_required', 'failed')),
+    message              TEXT NOT NULL,
+    details_json         TEXT,
+    snapshot_end_file_id INTEGER NOT NULL DEFAULT 0,
+    end_file_id          INTEGER REFERENCES holding_file(id),
+    result_batch_id      INTEGER REFERENCES result_batch(id),
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS merge_file (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_run_id  INTEGER NOT NULL REFERENCES merge_run(id),
+    filename      TEXT NOT NULL,
+    stored_name   TEXT NOT NULL,
+    row_count     INTEGER NOT NULL,
+    rows_json     TEXT NOT NULL,
+    accounts_json TEXT NOT NULL DEFAULT '[]',
+    adopted       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_merge_file_run ON merge_file(merge_run_id);
 
 CREATE TABLE IF NOT EXISTS result_batch (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,9 +135,23 @@ def init_db(path: str) -> None:
     conn = sqlite3.connect(path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """向前兼容旧库：补齐新增列（CREATE TABLE IF NOT EXISTS 不会改表）。"""
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(holding_file)").fetchall()
+    }
+    if "source" not in columns:
+        conn.execute(
+            "ALTER TABLE holding_file ADD COLUMN source TEXT NOT NULL DEFAULT 'upload'"
+        )
+    if "merge_run_id" not in columns:
+        conn.execute("ALTER TABLE holding_file ADD COLUMN merge_run_id INTEGER")
 
 
 def init_app(app) -> None:

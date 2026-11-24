@@ -31,7 +31,18 @@
     .tag.superseded { background: #fff8c5; color: #9a6700; }
     .tag.failed { background: #ffebe9; color: var(--err); }
     .detail { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+    .row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end; }
+    .check { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px;
+             font-size: 13px; color: #1f2328; }
+    .file-accounts { margin-top: 10px; }
+    .file-block { border: 1px dashed var(--border); border-radius: 6px; padding: 8px 10px;
+                  margin-bottom: 8px; font-size: 13px; }
+    .file-block .name { font-weight: 600; margin-bottom: 4px; }
+    .witness { display: flex; gap: 24px; flex-wrap: wrap; }
+    .witness ul { margin: 4px 0 12px 18px; padding: 0; font-size: 13px; }
     code { background: #eff1f3; padding: 1px 5px; border-radius: 4px; }
+    input[type=text] { font-size: 13px; padding: 5px 8px; border: 1px solid var(--border);
+                       border-radius: 6px; }
   </style>
 </head>
 <body>

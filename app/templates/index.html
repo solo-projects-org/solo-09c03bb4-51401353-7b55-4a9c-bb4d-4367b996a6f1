@@ -29,11 +29,171 @@
       <button type="submit">上传/替换期末持仓</button>
     </form>
   </div>
-  <p class="muted">同周期再次上传按整表替换，自动触发重算；证券代码按文本处理（保留前导零）。</p>
+  <p class="muted">同周期再次上传按整表替换，自动触发重算；证券代码按文本处理（保留前导零）。
+    合表核对期间仍可从这里上传期末持仓，若期间有新期末表先入库，合表会提示重试。</p>
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">2. 上传 / 整表换报公告 CSV</h2>
+  <h2 style="margin-top:0">2. 期末合表（分账户报表 + 合并报表）</h2>
+  <form method="post" enctype="multipart/form-data" action="{{ url_for('main.merge_upload') }}"
+        id="merge-form">
+    <div class="row">
+      <div>
+        <label>报告日</label>
+        <input type="date" name="report_date" id="report-date" required>
+      </div>
+      <div style="flex:1; min-width:320px">
+        <label>应报账户（逗号分隔，最多 {{ max_merge_accounts }} 个）</label>
+        <input type="text" name="accounts" id="accounts" style="width:100%"
+               placeholder="例如：A01,A02,A03" required>
+      </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <div>
+        <label>该报告日的多份期末持仓 CSV（可多选，使用原格式）</label>
+        <input type="file" name="files" id="files" accept=".csv,text/csv" multiple required>
+      </div>
+      <button type="submit">入库并进入核对</button>
+    </div>
+    <div id="file-accounts" class="file-accounts"></div>
+    <p class="muted">
+      每份文件只能整表采用；每个应报账户在选定组合里必须恰好出现一次，缺行按零计。
+      上传后进入核对页，可逐份勾选该文件覆盖的账户后再核对。
+    </p>
+  </form>
+  <script>
+    (function () {
+      const filesInput = document.getElementById("files");
+      const accountsInput = document.getElementById("accounts");
+      const target = document.getElementById("file-accounts");
+      if (!filesInput || !target) return;
+
+      function currentAccounts() {
+        return (accountsInput.value || "")
+          .replace(/，/g, ",")
+          .split(/[,\n]/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+
+      function render() {
+        const accounts = currentAccounts();
+        target.innerHTML = "";
+        Array.from(filesInput.files || []).forEach((file, index) => {
+          const block = document.createElement("div");
+          block.className = "file-block";
+          const name = document.createElement("div");
+          name.className = "name";
+          name.textContent = (index + 1) + ". " + file.name;
+          block.appendChild(name);
+          if (!accounts.length) {
+            const hint = document.createElement("span");
+            hint.className = "muted";
+            hint.textContent = "请先填写应报账户，再勾选该文件覆盖的账户";
+            block.appendChild(hint);
+          }
+          accounts.forEach((acc) => {
+            const label = document.createElement("label");
+            label.className = "check";
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.name = "file_accounts_" + index;
+            box.value = acc;
+            label.appendChild(box);
+            label.appendChild(document.createTextNode(" " + acc));
+            block.appendChild(label);
+          });
+          target.appendChild(block);
+        });
+      }
+
+      filesInput.addEventListener("change", render);
+      accountsInput.addEventListener("change", render);
+    })();
+  </script>
+</div>
+
+{% if merge_view %}
+{% set run = merge_view.run %}
+{% set details = merge_view.details %}
+<div class="card" id="merge-run">
+  <h2 style="margin-top:0">合表批次 #{{ run.id }}
+    <span class="tag {{ run.status }}">{{ run.status }}</span>
+    <span class="muted">— 报告日 {{ run.report_date }}，应报账户
+      {{ merge_view.accounts | join('、') }}</span>
+  </h2>
+  <p>{{ run.message }}</p>
+
+  <form method="post" action="{{ url_for('main.merge_verify', run_id=run.id) }}">    <table>
+      <thead>
+        <tr><th>#</th><th>文件</th><th class="num">行数</th><th>覆盖的应报账户（勾选）</th>
+            <th>本次采用</th></tr>
+      </thead>
+      <tbody>
+      {% for f in merge_view.files %}
+        {% set selected = f.accounts_json | fromjson %}
+        {% set file_idx = loop.index0 %}
+        <tr>
+          <td>{{ loop.index }}</td>
+          <td>{{ f.filename }}</td>
+          <td class="num">{{ f.row_count }}</td>
+          <td>
+            {% for acc in merge_view.accounts %}
+              <label class="check">
+                <input type="checkbox" name="file_accounts_{{ file_idx }}"
+                       value="{{ acc }}"{% if acc in selected %} checked{% endif %}>
+                {{ acc }}
+              </label>
+            {% endfor %}
+          </td>
+          <td>{% if f.adopted %}<span class="tag active">已采用</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <p class="muted">
+      {{ merge_view.accounts | length }} 个应报账户。核对时不会枚举组合来证明一致：
+      一致性由账户覆盖的线性代数判定 + 账户子集动态规划给出；
+      只有确实不一致时，才展示两组组合文件及至少一项股数差异。
+    </p>
+    <div class="row">
+      <button type="submit">核对并生效</button>
+      {% if run.status == 'retry_required' %}
+        <label class="check"><input type="checkbox" name="rebase" value="1" checked>
+          以当前期末表为基线重新核对（新期末表不参与本次合表）</label>
+      {% endif %}
+    </div>
+  </form>
+
+  {% if details and details.status == 'mismatch' %}
+    <h3>核对失败：股数不一致</h3>
+    <p>{{ run.message }}</p>
+    <div class="witness">
+      <div>
+        <h4>组合 A 文件</h4>
+        <ul>{% for f in details.witness_a.files %}<li>{{ f }}</li>{% endfor %}</ul>
+      </div>
+      <div>
+        <h4>组合 B 文件</h4>
+        <ul>{% for f in details.witness_b.files %}<li>{{ f }}</li>{% endfor %}</ul>
+      </div>
+    </div>
+    <table>
+      <thead><tr><th>证券代码</th><th class="num">组合 A 合计</th><th class="num">组合 B 合计</th></tr></thead>
+      <tbody>
+      {% for d in details.differences %}
+        <tr><td>{{ d.code }}</td><td class="num">{{ d.shares_a }}</td><td class="num">{{ d.shares_b }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% elif details and details.status == 'incomplete' %}
+    <p class="flash error">无法凑齐：{{ run.message }}</p>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2 style="margin-top:0">3. 上传 / 整表换报公告 CSV</h2>
   <form class="inline" method="post" enctype="multipart/form-data"
         action="{{ url_for('main.announcements_replace') }}">
     <div>
@@ -51,7 +211,7 @@
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">3. 净变动表
+  <h2 style="margin-top:0">4. 净变动表
     {% if result %}
       <span class="muted">— 结果批次 #{{ result.id }}｜{{ result.begin_date }} ~ {{ result.end_date or '期末未上传（窗口上不封顶）' }}
         ｜公告批次 #{{ result.announcement_batch_id }}（{{ result.ann_filename }}）
@@ -61,6 +221,12 @@
   {% if not result %}
     <p class="muted">尚无可展示结果：请先上传期初持仓（及公告）。期末持仓缺失时实报股数按零计。</p>
   {% else %}
+  <p class="muted">
+    本次结果的期末持仓来自：
+    {% if result.end_file_id %}
+      持仓文件 #{{ result.end_file_id }}（{{ result.end_filename }}）
+    {% else %}期末未上传{% endif %}
+  </p>
   <table>
     <thead>
       <tr>
@@ -93,7 +259,29 @@
 </div>
 
 <div class="card">
-  <h2 style="margin-top:0">4. 历史版本（换报失败仍可查原表）</h2>
+  <h2 style="margin-top:0">5. 历史版本（换报失败仍可查原表）</h2>
+  <h3>期末合表批次</h3>
+  <table>
+    <thead><tr><th>#</th><th>报告日</th><th>状态</th><th class="num">文件数</th>
+      <th class="num">采用数</th><th>说明</th><th>时间</th><th></th></tr></thead>
+    <tbody>
+    {% for m in merge_runs %}
+      <tr>
+        <td>#{{ m.id }}</td>
+        <td>{{ m.report_date }}</td>
+        <td><span class="tag {{ m.status }}">{{ m.status }}</span></td>
+        <td class="num">{{ m.file_count }}</td>
+        <td class="num">{{ m.adopted_count }}</td>
+        <td>{{ m.message }}</td>
+        <td>{{ m.created_at }}</td>
+        <td><a href="{{ url_for('main.merge_detail', run_id=m.id) }}">查看</a></td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="muted">暂无合表批次</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
   <h3>结果批次</h3>
   <table>
     <thead><tr><th>#</th><th>区间</th><th>公告批次</th><th>触发说明</th><th>生成时间</th><th></th></tr></thead>
@@ -132,7 +320,8 @@
 
   <h3>持仓文件</h3>
   <table>
-    <thead><tr><th>#</th><th>周期</th><th>日期</th><th>文件</th><th>行数</th><th>当前生效</th><th>上传时间</th></tr></thead>
+    <thead><tr><th>#</th><th>周期</th><th>日期</th><th>文件</th><th>行数</th><th>来源</th>
+      <th>当前生效</th><th>上传时间</th></tr></thead>
     <tbody>
     {% for h in holdings %}
       <tr>
@@ -141,11 +330,12 @@
         <td>{{ h.as_of_date }}</td>
         <td>{{ h.filename }}</td>
         <td class="num">{{ h.row_count }}</td>
+        <td>{% if h.source == 'merge' %}合表 #{{ h.merge_run_id }}{% else %}上传{% endif %}</td>
         <td>{{ '是' if h.is_current else '否（历史版本）' }}</td>
         <td>{{ h.uploaded_at }}</td>
       </tr>
     {% else %}
-      <tr><td colspan="7" class="muted">暂无持仓文件</td></tr>
+      <tr><td colspan="8" class="muted">暂无持仓文件</td></tr>
     {% endfor %}
     </tbody>
   </table>

@@ -1,4 +1,4 @@
-"""业务服务层：上传、整表换报、增量重算、净变动查询。"""
+"""业务服务层：上传、整表换报、增量重算、期末合表、净变动查询。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from typing import Optional
 from .csv_utils import CsvError, parse_announcements, parse_holdings
 from .db import get_db
 from .engine import Announcement, Lot, simulate, trace_paths
+from .merge_verify import MergeInput, verify_merge
 
 
 # ---------------------------------------------------------------- 小工具
@@ -441,6 +442,379 @@ def _record_failed_batch(conn, filename: str, exc: Exception) -> None:
         conn.rollback()
 
 
+# ---------------------------------------------------------------- 期末合表
+
+MAX_MERGE_ACCOUNTS = 12
+
+
+@dataclass
+class MergeResult:
+    status: str  # awaiting_accounts / verified / retry_required / failed
+    message: str
+    run_id: int
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "verified"
+
+
+def create_merge_draft(
+    report_date: str,
+    accounts: list[str],
+    uploads: list[tuple[str, bytes, list[str]]],
+) -> int:
+    """入库一批待核对的期末文件（尚未生效），返回 merge_run.id。
+
+    uploads 每项为 (原始文件名, 文件字节, 该文件勾选的应报账户)。
+    文件先解析校验；任何一份解析失败则整批判失败（不产生草稿）。
+    """
+    accounts = _normalize_accounts(accounts)
+    if not accounts:
+        raise CsvError("至少填写一个应报账户")
+    if len(accounts) > MAX_MERGE_ACCOUNTS:
+        raise CsvError(f"应报账户最多 {MAX_MERGE_ACCOUNTS} 个，当前 {len(accounts)} 个")
+    if not uploads:
+        raise CsvError("至少上传一份期末持仓 CSV")
+
+    parsed: list[tuple[str, list[str], list[tuple[str, Decimal]], str]] = []
+    for filename, raw, file_accounts in uploads:
+        labels = _normalize_accounts(file_accounts)
+        unknown = [a for a in labels if a not in accounts]
+        if unknown:
+            raise CsvError(
+                f"文件 {filename} 勾选了未填写的应报账户：{', '.join(unknown)}"
+            )
+        rows = parse_holdings(raw)
+        stored = _save_upload(raw, "merge_end")
+        parsed.append((filename, labels, [(r.code, r.shares) for r in rows], stored))
+
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current_end = _current_holding(conn, "end")
+        cur = conn.execute(
+            "INSERT INTO merge_run "
+            "(report_date, accounts_json, status, message, snapshot_end_file_id) "
+            "VALUES (?, ?, 'awaiting_accounts', ?, ?)",
+            (
+                report_date,
+                json.dumps(accounts, ensure_ascii=False),
+                "已入库待填写应报账户覆盖并核对",
+                current_end["id"] if current_end is not None else 0,
+            ),
+        )
+        run_id = cur.lastrowid
+        conn.executemany(
+            "INSERT INTO merge_file "
+            "(merge_run_id, filename, stored_name, row_count, rows_json, accounts_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    run_id,
+                    filename,
+                    stored,
+                    len(rows),
+                    json.dumps(
+                        [[c, canon(s)] for c, s in rows], ensure_ascii=False
+                    ),
+                    json.dumps(labels, ensure_ascii=False),
+                )
+                for filename, labels, rows, stored in parsed
+            ],
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return run_id
+
+
+def _normalize_accounts(accounts: Optional[list[str]]) -> list[str]:
+    """去空白、去重并保持首次出现顺序。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in accounts or []:
+        acc = (raw or "").strip()
+        if not acc or acc in seen:
+            continue
+        seen.add(acc)
+        out.append(acc)
+    return out
+
+
+@dataclass
+class MergeRunView:
+    run: object
+    files: list[object]
+    accounts: list[str]
+    details: Optional[dict]
+
+
+def _load_merge_run(conn, run_id: int) -> MergeRunView:
+    run = conn.execute("SELECT * FROM merge_run WHERE id=?", (run_id,)).fetchone()
+    if run is None:
+        raise CsvError(f"合表批次 #{run_id} 不存在")
+    files = conn.execute(
+        "SELECT * FROM merge_file WHERE merge_run_id=? ORDER BY id", (run_id,)
+    ).fetchall()
+    accounts = json.loads(run["accounts_json"])
+    details = json.loads(run["details_json"]) if run["details_json"] else None
+    return MergeRunView(run=run, files=files, accounts=accounts, details=details)
+
+
+def verify_and_apply_merge(run_id: int, rebase: bool = False) -> MergeResult:
+    """核对合表草稿；通过则把合并后的期末持仓与净变动结果一起生效。
+
+    - 核对计算在数据库事务之外进行，核对期间原入口仍可正常上传期末持仓；
+    - 核对开始与结束各取一次「当前期末表」快照：期间若有新的期末表先入库，
+      本次合表标记为 retry_required，不产生任何生效数据；
+    - 草稿入库后、核对开始前若也有新的期末表先入库，同样提示重试；
+      rebase=True 表示用户已确认以当前期末表为基线重新核对（显式重试）；
+    - 失败或重试都不覆盖任何已生效的期末持仓或结果，旧结果仍可查。
+    """
+    conn = get_db()
+    view = _load_merge_run(conn, run_id)
+    run = view.run
+    if run["status"] == "verified":
+        return MergeResult("verified", "该合表批次已生效，无需重复核对", run_id)
+
+    accounts = view.accounts
+    inputs = [
+        MergeInput(
+            file_key=row["filename"],
+            rows=[(c, Decimal(s)) for c, s in json.loads(row["rows_json"])],
+            accounts=frozenset(json.loads(row["accounts_json"])),
+        )
+        for row in view.files
+    ]
+
+    current_end = _current_holding(conn, "end")
+    current_end_id = current_end["id"] if current_end is not None else 0
+    if current_end_id != run["snapshot_end_file_id"] and not rebase:
+        conn.execute(
+            "UPDATE merge_run SET status='retry_required', message=? WHERE id=?",
+            ("合表草稿入库后有新的期末表先入库，本次合表未生效，请重试", run_id),
+        )
+        conn.commit()
+        return MergeResult(
+            "retry_required",
+            "合表草稿入库后有新的期末表先入库，本次合表未生效，请重试",
+            run_id,
+        )
+
+    # 本次核对开始快照（显式重试时以当前期末表为基线）
+    conn.execute(
+        "UPDATE merge_run SET status='awaiting_accounts', snapshot_end_file_id=?, "
+        "message=? WHERE id=?",
+        (current_end_id, "核对中", run_id),
+    )
+    conn.commit()
+    snapshot_end_id = current_end_id
+
+    # 纯计算核对，不占用数据库写锁，期间原入口可继续上传期末持仓
+    try:
+        outcome = verify_merge(inputs, accounts)
+    except Exception as exc:  # pragma: no cover - 纯计算不应抛错，兜底不动已生效数据
+        message = f"核对计算出错，本次合表未生效：{exc}"
+        conn.execute(
+            "UPDATE merge_run SET status='failed', message=? WHERE id=?",
+            (message, run_id),
+        )
+        conn.commit()
+        return MergeResult("failed", message, run_id)
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        current_end = _current_holding(conn, "end")
+        current_end_id = current_end["id"] if current_end is not None else 0
+        if current_end_id != snapshot_end_id:
+            conn.execute(
+                "UPDATE merge_run SET status='retry_required', message=? WHERE id=?",
+                (
+                    "核对期间有新的期末持仓表先入库，本次合表未生效，请重新核对",
+                    run_id,
+                ),
+            )
+            conn.commit()
+            return MergeResult(
+                "retry_required",
+                "核对期间有新的期末持仓表先入库，本次合表未生效，请重新上传并核对",
+                run_id,
+            )
+
+        if outcome.status == "ok":
+            begin_file = _current_holding(conn, "begin")
+            if begin_file is None:
+                message = "期初持仓尚未上传，无法计算净变动；请先上传期初持仓再合表"
+                conn.execute(
+                    "UPDATE merge_run SET status='failed', message=? WHERE id=?",
+                    (message, run_id),
+                )
+                conn.commit()
+                return MergeResult("failed", message, run_id)
+            if run["report_date"] < begin_file["as_of_date"]:
+                message = (
+                    f"报告日 {run['report_date']} 早于期初日 "
+                    f"{begin_file['as_of_date']}，无法折算"
+                )
+                conn.execute(
+                    "UPDATE merge_run SET status='failed', message=? WHERE id=?",
+                    (message, run_id),
+                )
+                conn.commit()
+                return MergeResult("failed", message, run_id)
+
+            adopted = [view.files[i] for i in outcome.chosen]
+            merge_names = "、".join(row["filename"] for row in adopted)
+
+            # 合并期末持仓：以整表替换方式写入 holding_file（period=end）
+            holdings = outcome.holdings
+            file_cur = conn.execute(
+                "INSERT INTO holding_file "
+                "(period, as_of_date, filename, row_count, source, merge_run_id) "
+                "VALUES ('end', ?, ?, ?, 'merge', ?)",
+                (
+                    run["report_date"],
+                    f"合表采用：{merge_names}",
+                    len(holdings),
+                    run_id,
+                ),
+            )
+            end_file_id = file_cur.lastrowid
+            conn.executemany(
+                "INSERT INTO holding_row (file_id, code, shares) VALUES (?, ?, ?)",
+                [(end_file_id, code, canon(shares)) for code, shares in holdings],
+            )
+            conn.execute(
+                "UPDATE holding_file SET is_current=0 WHERE period='end' AND id<>?",
+                (end_file_id,),
+            )
+
+            # 期末持仓与净变动表在同一事务内一起生效
+            result_id = _recompute_full(
+                conn,
+                _load_active_announcements(conn),
+                begin_file["id"],
+                end_file_id,
+                begin_file["as_of_date"],
+                run["report_date"],
+                "期末合表核对通过，合并期末持仓并重算净变动",
+            )
+            conn.execute(
+                "UPDATE merge_run SET status='verified', message=?, "
+                "end_file_id=?, result_batch_id=?, details_json=? WHERE id=?",
+                (
+                    outcome.message,
+                    end_file_id,
+                    result_id,
+                    json.dumps(_witness_payload(outcome), ensure_ascii=False),
+                    run_id,
+                ),
+            )
+            adopted_ids = {row["id"] for row in adopted}
+            conn.execute(
+                "UPDATE merge_file SET adopted=0 WHERE merge_run_id=?", (run_id,)
+            )
+            conn.executemany(
+                "UPDATE merge_file SET adopted=1 WHERE id=?",
+                [(fid,) for fid in adopted_ids],
+            )
+            conn.commit()
+            return MergeResult("verified", outcome.message, run_id)
+
+        # 核对未通过：只记录本次失败，不动任何已生效数据
+        conn.execute(
+            "UPDATE merge_run SET status='failed', message=?, details_json=? WHERE id=?",
+            (
+                outcome.message,
+                json.dumps(_witness_payload(outcome), ensure_ascii=False),
+                run_id,
+            ),
+        )
+        conn.commit()
+        return MergeResult("failed", outcome.message, run_id)
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def update_merge_assignments(run_id: int, assignments: dict[int, list[str]]) -> None:
+    """更新合表批次中每份文件勾选的应报账户（供核对失败后调整重试）。"""
+    conn = get_db()
+    run = conn.execute("SELECT * FROM merge_run WHERE id=?", (run_id,)).fetchone()
+    if run is None:
+        raise CsvError(f"合表批次 #{run_id} 不存在")
+    accounts = set(json.loads(run["accounts_json"]))
+    files = conn.execute(
+        "SELECT id FROM merge_file WHERE merge_run_id=?", (run_id,)
+    ).fetchall()
+    known_ids = {row["id"] for row in files}
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for file_id, labels in assignments.items():
+            if file_id not in known_ids:
+                raise CsvError(f"合表文件 #{file_id} 不属于该批次")
+            cleaned = _normalize_accounts(labels)
+            unknown = [a for a in cleaned if a not in accounts]
+            if unknown:
+                raise CsvError(
+                    f"文件勾选了未填写的应报账户：{', '.join(unknown)}"
+                )
+            conn.execute(
+                "UPDATE merge_file SET accounts_json=? WHERE id=?",
+                (json.dumps(cleaned, ensure_ascii=False), file_id),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _witness_payload(outcome) -> dict:
+    payload: dict = {"status": outcome.status}
+    if outcome.differences:
+        payload["differences"] = [
+            {
+                "code": d["code"],
+                "shares_a": canon(d["shares_a"]),
+                "shares_b": canon(d["shares_b"]),
+            }
+            for d in outcome.differences
+        ]
+    if outcome.witness_a:
+        payload["witness_a"] = {
+            "files": outcome.witness_a["files"],
+            "holdings": {
+                code: canon(shares)
+                for code, shares in outcome.witness_a["holdings"].items()
+            },
+        }
+    if outcome.witness_b:
+        payload["witness_b"] = {
+            "files": outcome.witness_b["files"],
+            "holdings": {
+                code: canon(shares)
+                for code, shares in outcome.witness_b["holdings"].items()
+            },
+        }
+    return payload
+
+
+def list_merge_runs():
+    conn = get_db()
+    return conn.execute(
+        "SELECT mr.*, "
+        "(SELECT COUNT(*) FROM merge_file mf WHERE mf.merge_run_id=mr.id) AS file_count, "
+        "(SELECT COUNT(*) FROM merge_file mf WHERE mf.merge_run_id=mr.id AND mf.adopted=1) "
+        "AS adopted_count "
+        "FROM merge_run mr ORDER BY mr.id DESC"
+    ).fetchall()
+
+
+def get_merge_run(run_id: int) -> MergeRunView:
+    return _load_merge_run(get_db(), run_id)
+
+
 # ---------------------------------------------------------------- 查询
 
 @dataclass
@@ -456,8 +830,10 @@ class NetChangeRow:
 def get_net_change(result_id: Optional[int] = None) -> tuple[Optional[object], list[NetChangeRow]]:
     conn = get_db()
     result = conn.execute(
-        "SELECT rb.*, ab.filename AS ann_filename "
+        "SELECT rb.*, ab.filename AS ann_filename, "
+        "hf.source AS end_source, hf.filename AS end_filename "
         "FROM result_batch rb JOIN announcement_batch ab ON ab.id=rb.announcement_batch_id "
+        "LEFT JOIN holding_file hf ON hf.id=rb.end_file_id "
         + ("WHERE rb.id=?" if result_id is not None else "")
         + " ORDER BY rb.id DESC LIMIT 1",
         (result_id,) if result_id is not None else (),
@@ -477,7 +853,6 @@ def get_net_change(result_id: Optional[int] = None) -> tuple[Optional[object], l
             (result["end_file_id"],),
         ).fetchall():
             reported[r["code"]] = Decimal(r["shares"])
-
     # 按期末代码聚合折算来源
     grouped: dict[str, list[object]] = {}
     for lot in lots:
